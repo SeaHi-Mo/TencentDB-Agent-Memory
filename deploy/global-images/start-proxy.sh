@@ -149,6 +149,28 @@ redis:
   enabled: false
 YAML
 
+# ── 本地源码热修挂载（可选）─────────────────────────────────────────────
+# 容器 ENTRYPOINT 是 `node --import tsx/esm src/index.ts`（Dockerfile:105），
+# 直接执行 TS 源码、不预编译 —— 所以把改过的源文件只读挂进去就生效，无需重建镜像。
+#
+# 修的是 session-init 的 `getLastUserMessageText`（session/*/cleaner.ts）：
+# dsh 原生 `ask_user_question` 的回答，tool_call_id 是上游 LLM 的普通 id
+# （`call_00_…`），不带 proxy 伪造表的 `call_dsh_session_init_` 前缀。旧逻辑
+# 不认领它 → 扫描回退到上一阶段（team_select）的旧回答 → extractAgentOnly
+# 永远抽不到 agent → attemptCount 到 maxRetries → status:initialized +
+# bypassed:true → 整个会话 L0 一条都不写。
+#
+# 源码目录不存在时（例如只拷了 deploy/ 目录单独部署）静默跳过，保持镜像原行为。
+SRC_ROOT="$SCRIPT_DIR/../../MemoryProxy/src"
+SRC_MOUNTS=()
+if [[ -f "$SRC_ROOT/session/codebuddy/cleaner.ts" ]]; then
+  SRC_MOUNTS+=(-v "$SRC_ROOT/session/codebuddy/cleaner.ts:/app/src/session/codebuddy/cleaner.ts:ro")
+  SRC_MOUNTS+=(-v "$SRC_ROOT/session/claude-code/cleaner.ts:/app/src/session/claude-code/cleaner.ts:ro")
+  info "挂载本地源码热修 → cleaner.ts (codebuddy + claude-code)"
+else
+  warn "未找到 $SRC_ROOT，跳过源码热修挂载（沿用镜像内源码）"
+fi
+
 info "启动 proxy (image=$PROXY_IMAGE, port=$PROXY_PORT)"
 $DOCKER run -d --name "$CONTAINER" \
   --network "$NETWORK" \
@@ -156,6 +178,7 @@ $DOCKER run -d --name "$CONTAINER" \
   --add-host=host.docker.internal:host-gateway \
   -p "${PROXY_PORT}:8096" \
   -v "$CONFIG_FILE:/data/config.yaml:ro" \
+  ${SRC_MOUNTS[@]+"${SRC_MOUNTS[@]}"} \
   "$PROXY_IMAGE" >/dev/null
 
 wait_healthy "$CONTAINER" 90

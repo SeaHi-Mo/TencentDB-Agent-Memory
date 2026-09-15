@@ -72,6 +72,9 @@ if [[ -s "$ADMIN_KEY_FILE" ]]; then
   echo "  └────────────────────────────────────────────────────────────────┘"
 fi
 echo ""
-echo "  查看日志：  docker logs -f tdai-memory-core | tdai-memory-hub | tdai-proxy"
+echo "  查看日志（docker logs 一次只能跟一个容器，| 是管道不是分隔符）："
+echo "              docker logs -f tdai-memory-core"
+echo "              docker logs -f tdai-memory-hub"
+echo "              docker logs -f tdai-proxy"
 echo "  停止服务：  ./stop-all.sh"
 echo ""
