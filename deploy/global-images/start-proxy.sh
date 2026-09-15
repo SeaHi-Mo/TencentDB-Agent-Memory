@@ -71,9 +71,13 @@ if [[ "$PROXY_ENABLE_SESSION_INIT" == "1" && "$PROXY_ENABLE_AUTH" != "1" ]]; the
   PROXY_ENABLE_AUTH=1
 fi
 
+# skillRuntime.allowLlmWrite —— 是否允许 LLM 经 skill-bridge 创建/修改 skill。
+# 默认关闭（消融实验口径）；置 1 时 patch/create/update/delete/files-write 才可用。
+PROXY_ENABLE_SKILL_WRITE="${PROXY_ENABLE_SKILL_WRITE:-0}"
+
 bool() { [[ "$1" == "1" ]] && echo "true" || echo "false"; }
 
-info "生成 proxy config → $CONFIG_FILE  (auth=$(bool $PROXY_ENABLE_AUTH) session-init=$(bool $PROXY_ENABLE_SESSION_INIT) tdai=$(bool $PROXY_ENABLE_TDAI))"
+info "生成 proxy config → $CONFIG_FILE  (auth=$(bool $PROXY_ENABLE_AUTH) session-init=$(bool $PROXY_ENABLE_SESSION_INIT) tdai=$(bool $PROXY_ENABLE_TDAI) skill-write=$(bool $PROXY_ENABLE_SKILL_WRITE))"
 cat > "$CONFIG_FILE" <<YAML
 # 由 start-proxy.sh 自动生成 —— 每次启动覆盖，请不要手动改。
 server:
@@ -144,6 +148,11 @@ injection:
     - skill
     - knowledge
     - tdai-memory
+
+# skill-bridge 的写权限：false 时 patch / create / update / delete / files-write 一律 40302。
+# 打开后主模型可直接创建、修改 skill（见 MemoryProxy/config.example.yaml skillRuntime）。
+skillRuntime:
+  allowLlmWrite: $(bool $PROXY_ENABLE_SKILL_WRITE)
 
 redis:
   enabled: false
