@@ -80,6 +80,22 @@ export function getLastUserMessageText(messages: RawMessage[]): string {
       return text;
     }
 
+    // dsh 原生 `ask_user_question`（本地 harness 执行）的回答，tool 消息形状为
+    //   {"answers":[{"id":"agent_select","selected":["dsh-cli开发 (agent-216adc4a)"]}]}
+    // 但 tool_call_id 是上游 LLM 的普通 id（`call_00_…`），不匹配上面的
+    // session-init 前缀。若不在此认领，扫描会继续往前回退到上一阶段
+    // （team_select）那份带前缀的旧回答 —— extractAgentOnly 于是永远拿 team
+    // 文本去 matchAgentInTeam，抽不到 agent → attemptCount 累到 maxRetries →
+    // bypass（status:initialized + bypassed:true）→ L0 一条都不写。
+    // 返回原文即可：matchAgentInTeam 的 `text.includes(agent_name)` 能从 JSON
+    // 里命中 agent 名。
+    if (
+      role === "tool"
+      && /"id"\s*:\s*"(asset_confirm|team_select|agent_select|task_select)"/.test(text)
+    ) {
+      return text;
+    }
+
     // User messages with form markers have highest priority for old format
     if (role === "user" && (text.includes("<question_answer") || containsFormTitle(text))) {
       return text;

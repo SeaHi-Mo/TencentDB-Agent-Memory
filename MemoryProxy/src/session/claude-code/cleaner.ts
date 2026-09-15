@@ -37,7 +37,16 @@ export function getLastUserMessageText(messages: RawMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === "tool") {
       const text = getMessageText(messages[i]);
-      if (text && (text.includes("AskUserQuestion") || text.includes("multi_question_result") || containsFormTitle(text))) {
+      if (
+        text
+        && (text.includes("AskUserQuestion")
+          || text.includes("multi_question_result")
+          || containsFormTitle(text)
+          // dsh 原生 ask_user_question 的回答形状：
+          //   {"answers":[{"id":"agent_select","selected":["…"]}]}
+          // 同样要认领，否则会 fallback 到最后一条 user 消息，丢掉用户的选择。
+          || /"id"\s*:\s*"(asset_confirm|team_select|agent_select|task_select)"/.test(text))
+      ) {
         return text;
       }
     }
