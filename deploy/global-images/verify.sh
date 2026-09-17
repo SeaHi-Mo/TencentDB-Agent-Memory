@@ -223,16 +223,37 @@ else
   done
 
   # 5. 端口占用（仅提醒）
-  for port_var in MEMORY_CORE_PORT PANEL_PORT KNOWLEDGE_PORT PROXY_PORT; do
-    port="${!port_var:-}"
+  #    Panel 以宿主机实际发布端口为准（设了 PANEL_HOST_PORT 就是它）；设了
+  #    PANEL_HOST_PORT 时 PANEL_PORT(8125) 是 wsl-relay 原生转发的地盘，
+  #    被它占用不算冲突（见 wsl-relay/README.md）。
+  _chk_label="PANEL_PORT"
+  [[ -n "${PANEL_HOST_PORT:-}" ]] && _chk_label="PANEL_HOST_PORT"
+  for _chk_pair in \
+    "MEMORY_CORE_PORT|${MEMORY_CORE_PORT:-}" \
+    "${_chk_label}|${PANEL_HOST_PORT:-${PANEL_PORT:-}}" \
+    "KNOWLEDGE_PORT|${KNOWLEDGE_PORT:-}" \
+    "PROXY_PORT|${PROXY_PORT:-}"; do
+    _chk_var="${_chk_pair%%|*}"
+    port="${_chk_pair#*|}"
     if [[ -z "$port" ]]; then continue; fi
-    if lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    if port_in_use "$port"; then
       WARNS=$((WARNS+1))
-      warn "端口 $port ($port_var) 已被占用，启动前请释放或在 .env 改端口"
+      warn "端口 $port ($_chk_var) 已被占用，启动前请释放或在 .env 改端口"
     else
-      ok "端口 $port ($port_var) 空闲"
+      ok "端口 $port ($_chk_var) 空闲"
     fi
   done
+  if [[ -n "${PANEL_HOST_PORT:-}" && "$PANEL_HOST_PORT" != "${PANEL_PORT:-}" ]]; then
+    if ! port_in_use "$PANEL_PORT"; then
+      WARNS=$((WARNS+1))
+      warn "端口 $PANEL_PORT 无人监听：wsl-relay 没在跑，Windows 侧访问不到 Panel"
+    elif port_owned_by_relay "$PANEL_PORT"; then
+      ok "端口 $PANEL_PORT 由 wsl-relay 原生转发占用（预期）"
+    else
+      WARNS=$((WARNS+1))
+      warn "端口 $PANEL_PORT 被非 wsl-relay 进程占用：wsl-relay 将无法绑定"
+    fi
+  fi
 
   # 6. LLM 通路（默认检查，--skip-llm 跳过）
   if (( SKIP_LLM == 1 )); then

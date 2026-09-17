@@ -404,15 +404,47 @@ interactive_llm_setup() {
 
 # port_in_use <port>
 #   检测宿主机某端口是否处于 LISTEN 状态。返回 0=被占 / 1=空闲。
+#   lsof 与 ss 都试一遍：在容器 / PID 命名空间里 lsof 可能看不到宿主进程，
+#   只信 lsof 会得到「假空闲」。
 port_in_use() {
   local port="$1"
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
-  elif command -v ss >/dev/null 2>&1; then
-    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${port}$"
-  else
-    return 1  # 无检测工具时当作空闲，不阻塞启动
+  if command -v lsof >/dev/null 2>&1 \
+     && lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+    return 0
   fi
+  if command -v ss >/dev/null 2>&1 \
+     && ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${port}$"; then
+    return 0
+  fi
+  return 1  # 无检测工具时当作空闲，不阻塞启动
+}
+
+# port_listen_pids <port>
+#   输出监听该端口的进程 PID（空格分隔；取不到则为空）。
+port_listen_pids() {
+  local port="$1" pids=""
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | tr '\n' ' ' || true)"
+  fi
+  if [[ -z "${pids// /}" ]] && command -v ss >/dev/null 2>&1; then
+    pids="$(ss -ltnp 2>/dev/null | awk -v p=":$port" '$4 ~ (p "$")' \
+      | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u | tr '\n' ' ' || true)"
+  fi
+  printf '%s' "$pids"
+}
+
+# port_owned_by_relay <port>
+#   该端口的监听者里是否有 wsl-relay.py（WSL2 mirrored 模式下的原生端口转发，
+#   见 wsl-relay/README.md）。返回 0=是 / 1=否或无法判定。
+port_owned_by_relay() {
+  local port="$1" pid cmdline
+  for pid in $(port_listen_pids "$port"); do
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+    if [[ "$cmdline" == *wsl-relay* ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # tdai_self_ports
@@ -430,25 +462,52 @@ tdai_self_ports() {
 }
 
 # check_ports
-#   一次性检查 4 个目标端口是否被占用；被「外部进程」占用则报错退出。
-#   会排除 tdai 自己容器占用的端口（那些会在启动时被重建）。
+#   检查 Docker 即将发布的「宿主机端口」是否被外部进程占用；被占用则报错退出。
+#   - 排除 tdai 自己旧容器占用的端口（启动时会被重建）。
+#   - 以宿主机实际发布端口为准：Panel 设了 PANEL_HOST_PORT 时发的是它，
+#     此时 PANEL_PORT(8125) 是 wsl-relay 原生转发的地盘 —— 被它占着才正常，
+#     不能当成冲突（否则 start-all.sh 会在预检阶段直接退出）。
 check_ports() {
-  local self_ports port_var port conflict=0
+  local self_ports port var_name pair panel_host_port panel_label conflict=0
   self_ports=" $(tdai_self_ports) "
+  panel_host_port="${PANEL_HOST_PORT:-${PANEL_PORT:-}}"
+  panel_label="PANEL_PORT"
+  [[ -n "${PANEL_HOST_PORT:-}" ]] && panel_label="PANEL_HOST_PORT"
+
   info "═══ 端口预检 ══════════════════════════════════════════"
-  for port_var in MEMORY_CORE_PORT PANEL_PORT KNOWLEDGE_PORT PROXY_PORT; do
-    port="${!port_var:-}"
+  local pairs=(
+    "MEMORY_CORE_PORT|${MEMORY_CORE_PORT:-}"
+    "${panel_label}|${panel_host_port}"
+    "KNOWLEDGE_PORT|${KNOWLEDGE_PORT:-}"
+    "PROXY_PORT|${PROXY_PORT:-}"
+  )
+  for pair in "${pairs[@]}"; do
+    var_name="${pair%%|*}"
+    port="${pair#*|}"
     if [[ -z "$port" ]]; then continue; fi
     if [[ "$self_ports" == *" $port "* ]]; then
-      info "端口 $port ($port_var) 由 tdai 旧容器占用（启动时会重建），跳过"
+      info "端口 $port ($var_name) 由 tdai 旧容器占用（启动时会重建），跳过"
       continue
     fi
     if port_in_use "$port"; then
-      echo "${C_RED}[error]${C_RST} 端口 $port ($port_var) 已被占用，请释放该端口或在 .env 改端口。" >&2
+      echo "${C_RED}[error]${C_RST} 端口 $port ($var_name) 已被占用，请释放该端口或在 .env 改端口。" >&2
       conflict=1
     else
-      ok "端口 $port ($port_var) 空闲"
+      ok "端口 $port ($var_name) 空闲"
     fi
   done
+
+  # Panel 转发口：两者不同（即 WSL2 mirrored 模式的 wsl-relay 方案）时，
+  # PANEL_PORT 由 wsl-relay.py 常驻监听。它占着是预期状态，只提示不拦。
+  if [[ -n "${PANEL_HOST_PORT:-}" && "$PANEL_HOST_PORT" != "${PANEL_PORT:-}" ]]; then
+    if ! port_in_use "$PANEL_PORT"; then
+      warn "端口 $PANEL_PORT 无人监听：wsl-relay 没在跑，Windows 侧访问不到 Panel（见 wsl-relay/README.md）。"
+    elif port_owned_by_relay "$PANEL_PORT"; then
+      ok "端口 $PANEL_PORT 由 wsl-relay 原生转发占用（预期），Windows 访问 http://localhost:${PANEL_PORT}/"
+    else
+      warn "端口 $PANEL_PORT 被非 wsl-relay 进程占用：wsl-relay 将无法绑定，Windows 侧访问不到 Panel。"
+    fi
+  fi
+
   (( conflict == 0 )) || die "存在端口冲突，请先释放端口后重试。"
 }
