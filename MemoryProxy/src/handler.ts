@@ -1330,6 +1330,35 @@ export async function handleChatCompletions(
     }
   }
 
+  // ── Context offload（可选，默认关闭）────────────────────────────────────
+  // 推工具对给 Core 触发 L1 摘要；超过阈值且过冷却期时，用服务端压缩后的
+  // messages 替换请求体。任何失败都 fail-open（保持原始 body）。
+  // 只在"主请求"上做：auxiliary（客户端自己的 compaction / title-gen）跳过，
+  // 但 dsh headless（无 ask_user_question）仍要压 —— 它同样在烧上下文。
+  if (config.offload?.enabled && !isAuxiliary) {
+    try {
+      const { runOffload } = await import("./offload/index.js");
+      const { messageText } = await import("./offload/helpers.js");
+      const sysMsg = Array.isArray(messages)
+        ? messages.find((m) => (m as Record<string, unknown>)?.role === "system")
+        : undefined;
+      const offloadResult = await runOffload({
+        config: config.offload,
+        sessionKey,
+        messages: Array.isArray(messages) ? messages : [],
+        systemPrompt: sysMsg ? messageText(sysMsg) : null,
+        userPrompt: tdaiUserMessage ?? null,
+        spaceId,
+      });
+      if (offloadResult?.messages) {
+        messages = offloadResult.messages;
+        body.messages = offloadResult.messages;
+      }
+    } catch (err: unknown) {
+      console.warn(`[offload] handler error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
 
   // ── Resolve forward target (opaque extension — no routing logic here) ──

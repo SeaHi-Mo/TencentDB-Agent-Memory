@@ -3,6 +3,37 @@
 import { readFileSync } from "node:fs";
 import { load as yamlLoad } from "js-yaml";
 import type { CostGuardConfig, ProxyConfig, RawYamlConfig } from "./types.js";
+import { DEFAULT_OFFLOAD_CONFIG, type OffloadClientConfig } from "./offload/index.js";
+
+/**
+ * 解析 `offload:` 段。全部字段可选，缺省时沿用 DEFAULT_OFFLOAD_CONFIG
+ * （enabled=false → 完全关闭）。
+ */
+function parseOffload(yaml: RawYamlConfig): OffloadClientConfig {
+  const raw = (yaml.offload ?? {}) as Record<string, unknown>;
+  const num = (v: unknown, dflt: number): number =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : dflt;
+  const str = (v: unknown, dflt: string): string => (typeof v === "string" ? v : dflt);
+  const level = str(raw.level, DEFAULT_OFFLOAD_CONFIG.level);
+  return {
+    enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_OFFLOAD_CONFIG.enabled,
+    endpoint: str(raw.endpoint, DEFAULT_OFFLOAD_CONFIG.endpoint),
+    serviceToken: str(raw.serviceToken, DEFAULT_OFFLOAD_CONFIG.serviceToken),
+    serviceId: str(raw.serviceId, DEFAULT_OFFLOAD_CONFIG.serviceId),
+    level: (["mild", "aggressive", "emergency"] as const).includes(level as never)
+      ? (level as OffloadClientConfig["level"])
+      : DEFAULT_OFFLOAD_CONFIG.level,
+    triggerTokens: num(raw.triggerTokens, DEFAULT_OFFLOAD_CONFIG.triggerTokens),
+    cooldownTurns: num(raw.cooldownTurns, DEFAULT_OFFLOAD_CONFIG.cooldownTurns),
+    maxIngestPairs: num(raw.maxIngestPairs, DEFAULT_OFFLOAD_CONFIG.maxIngestPairs),
+    timeoutMs: num(raw.timeoutMs, DEFAULT_OFFLOAD_CONFIG.timeoutMs),
+    dryRun: typeof raw.dryRun === "boolean" ? raw.dryRun : DEFAULT_OFFLOAD_CONFIG.dryRun,
+    contextWindow: typeof raw.contextWindow === "number" && raw.contextWindow > 0
+      ? raw.contextWindow
+      : undefined,
+    maxSessions: num(raw.maxSessions, DEFAULT_OFFLOAD_CONFIG.maxSessions),
+  };
+}
 
 const DEFAULT_UPSTREAM = "https://llm-upstream.example.com/v2/chat/completions";
 
@@ -88,6 +119,9 @@ export const DEFAULT_CONFIG: ProxyConfig = {
     enabled: true,
     extractors: ["skill", "tdai-memory"],
   },
+  // Context offload 默认关闭：不配 `offload:` 段时 runOffload() 直接返回 null，
+  // 热路径零开销、行为与改动前完全一致。
+  offload: DEFAULT_OFFLOAD_CONFIG,
   sessionInit: {
     enabled: false,
     maxRetries: 3,
@@ -414,6 +448,7 @@ export function buildConfig(overrides: CliOverrides = {}): ProxyConfig {
       enabled: yaml.extraction?.enabled ?? DEFAULT_CONFIG.extraction.enabled,
       extractors: yaml.extraction?.extractors ?? DEFAULT_CONFIG.extraction.extractors,
     },
+    offload: parseOffload(yaml),
   sessionInit: {
     enabled: yaml.sessionInit?.enabled ?? DEFAULT_CONFIG.sessionInit.enabled,
     maxRetries: yaml.sessionInit?.maxRetries ?? DEFAULT_CONFIG.sessionInit.maxRetries,

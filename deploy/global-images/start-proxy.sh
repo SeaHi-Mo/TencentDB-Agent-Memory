@@ -190,6 +190,40 @@ if [[ -n "${PROXY_EXTRACTION_ENABLED:-}" || -n "${PROXY_EXTRACTORS:-}" ]]; then
 "
 fi
 
+# ── Context offload（可选，默认关闭）───────────────────────────────────────
+# proxy 把工具对推给 Core 的 offload server 触发 L1 摘要（/v2/offload/ingest），
+# 并在上下文超过阈值、且过了冷却期时，用 /v2/offload/compact 返回的 messages
+# 替换请求体 —— 旧的工具结果被换成摘要 + 注入任务图 MMD。
+#
+# ⚠️ 改写历史会让上游 prompt cache 整段失效（deepseek-flash 缓存命中 ¥0.02/M
+# vs 未命中 ¥1/M，差 50 倍），所以 cooldownTurns 必须远大于盈亏平衡点
+# （典型 ~12 轮）。默认 40。
+PROXY_OFFLOAD_ENABLED="${PROXY_OFFLOAD_ENABLED:-0}"
+PROXY_OFFLOAD_LEVEL="${PROXY_OFFLOAD_LEVEL:-mild}"
+PROXY_OFFLOAD_TRIGGER_TOKENS="${PROXY_OFFLOAD_TRIGGER_TOKENS:-120000}"
+PROXY_OFFLOAD_COOLDOWN_TURNS="${PROXY_OFFLOAD_COOLDOWN_TURNS:-40}"
+PROXY_OFFLOAD_TIMEOUT_MS="${PROXY_OFFLOAD_TIMEOUT_MS:-20000}"
+PROXY_OFFLOAD_DRYRUN="${PROXY_OFFLOAD_DRYRUN:-0}"
+case "$PROXY_OFFLOAD_LEVEL" in
+  mild|aggressive|emergency) ;;
+  *) die "PROXY_OFFLOAD_LEVEL='${PROXY_OFFLOAD_LEVEL}' 只能是 mild / aggressive / emergency" ;;
+esac
+require_uint PROXY_OFFLOAD_TRIGGER_TOKENS PROXY_OFFLOAD_COOLDOWN_TURNS PROXY_OFFLOAD_TIMEOUT_MS
+OFFLOAD_YAML="offload:
+  enabled: $(bool "$PROXY_OFFLOAD_ENABLED")
+  endpoint: \"http://memory-core:8420\"
+  serviceToken: \"${MEMORY_CORE_GATEWAY_API_KEY}\"
+  serviceId: default
+  level: ${PROXY_OFFLOAD_LEVEL}
+  triggerTokens: ${PROXY_OFFLOAD_TRIGGER_TOKENS}
+  cooldownTurns: ${PROXY_OFFLOAD_COOLDOWN_TURNS}
+  timeoutMs: ${PROXY_OFFLOAD_TIMEOUT_MS}
+  dryRun: $(bool "$PROXY_OFFLOAD_DRYRUN")
+"
+if [[ "$PROXY_OFFLOAD_ENABLED" == "1" ]]; then
+  info "  context offload → level=${PROXY_OFFLOAD_LEVEL} trigger=${PROXY_OFFLOAD_TRIGGER_TOKENS}tok cooldown=${PROXY_OFFLOAD_COOLDOWN_TURNS}轮 dryRun=$(bool "$PROXY_OFFLOAD_DRYRUN")"
+fi
+
 info "生成 proxy config → $CONFIG_FILE  (auth=$(bool $PROXY_ENABLE_AUTH) session-init=$(bool $PROXY_ENABLE_SESSION_INIT) tdai=$(bool $PROXY_ENABLE_TDAI) skill-write=$(bool $PROXY_ENABLE_SKILL_WRITE) injectors=${PROXY_INJECTORS:-none})"
 cat > "$CONFIG_FILE" <<YAML
 # 由 start-proxy.sh 自动生成 —— 每次启动覆盖，请不要手动改。
@@ -272,6 +306,8 @@ skillRuntime:
 # 写侧（对话回流内核 + skill 归档）。只有显式设置 PROXY_EXTRACTION_ENABLED /
 # PROXY_EXTRACTORS 时才写这一段，未设置时沿用镜像内默认（enabled=true）。
 ${EXTRACTION_YAML}
+# Context offload 客户端（默认 enabled:false → 热路径零开销）。
+${OFFLOAD_YAML}
 redis:
   enabled: false
 YAML
@@ -293,7 +329,17 @@ SRC_MOUNTS=()
 if [[ -f "$SRC_ROOT/session/codebuddy/cleaner.ts" ]]; then
   SRC_MOUNTS+=(-v "$SRC_ROOT/session/codebuddy/cleaner.ts:/app/src/session/codebuddy/cleaner.ts:ro")
   SRC_MOUNTS+=(-v "$SRC_ROOT/session/claude-code/cleaner.ts:/app/src/session/claude-code/cleaner.ts:ro")
-  info "挂载本地源码热修 → cleaner.ts (codebuddy + claude-code)"
+  # offload 客户端是新目录（镜像内没有）：整目录挂进去，改完只需重启容器。
+  if [[ -d "$SRC_ROOT/offload" ]]; then
+    SRC_MOUNTS+=(-v "$SRC_ROOT/offload:/app/src/offload:ro")
+    # 两个 handler 里加了 offload 接线（镜像内没有这段），一并挂进去。
+    # 已验证：仓库版 = 镜像版 + offload 块，其余逐行一致。
+    SRC_MOUNTS+=(-v "$SRC_ROOT/handler.ts:/app/src/handler.ts:ro")
+    SRC_MOUNTS+=(-v "$SRC_ROOT/anthropicHandler.ts:/app/src/anthropicHandler.ts:ro")
+    # config.ts 负责解析生成的 `offload:` 段（镜像内不认识），必须一起挂。
+    SRC_MOUNTS+=(-v "$SRC_ROOT/config.ts:/app/src/config.ts:ro")
+  fi
+  info "挂载本地源码热修 → cleaner.ts (codebuddy + claude-code) + offload/ + handler.ts + anthropicHandler.ts + config.ts"
 else
   warn "未找到 $SRC_ROOT，跳过源码热修挂载（沿用镜像内源码）"
 fi

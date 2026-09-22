@@ -478,6 +478,12 @@ export interface ProxyConfig {
   creditPricing: CreditPricingConfig;  // NEW: model pricing for credit calculation
   injection: InjectionConfig;
   extraction: ExtractionConfig;
+  /**
+   * Context offload（客户端半侧）：把工具对推给 Core 的 offload server 触发 L1
+   * 摘要，并在上下文超阈值时用服务端压缩后的 messages 替换请求体。
+   * 默认关闭；见 src/offload/index.ts 的 DEFAULT_OFFLOAD_CONFIG。
+   */
+  offload: import("./offload/index.js").OffloadClientConfig;
   sessionInit: SessionInitConfig;
   tdai: TdaiConfig;
   coreSkill: CoreSkillConfig;
@@ -776,6 +782,21 @@ export interface RawYamlConfig {
     apiKey?: string;
     /** Per-agent override map. See `AgentUpstreamEntry`. */
     agents?: Record<string, { url?: string; apiKey?: string } | null | undefined>;
+  };
+  /** Context offload 客户端配置（可选，缺省关闭）。见 src/offload/index.ts。 */
+  offload?: {
+    enabled?: boolean;
+    endpoint?: string;
+    serviceToken?: string;
+    serviceId?: string;
+    level?: "mild" | "aggressive" | "emergency";
+    triggerTokens?: number;
+    cooldownTurns?: number;
+    maxIngestPairs?: number;
+    timeoutMs?: number;
+    dryRun?: boolean;
+    contextWindow?: number;
+    maxSessions?: number;
   };
   log?: {
     file?: string;

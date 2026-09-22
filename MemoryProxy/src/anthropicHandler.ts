@@ -1231,6 +1231,29 @@ export async function handleAnthropicMessages(
     console.log(`[injection-debug] skipping injection for kind=sidequery session=${sessionKey}`);
   }
 
+  // ── Context offload（可选，默认关闭）────────────────────────────────────
+  // 与 handler.ts 同构：推工具对触发 L1 摘要，超阈值时用服务端压缩后的
+  // messages 替换请求体；任何失败都 fail-open。
+  if (config.offload?.enabled && !skipInjection) {
+    try {
+      const { runOffload } = await import("./offload/index.js");
+      const offloadResult = await runOffload({
+        config: config.offload,
+        sessionKey,
+        messages: Array.isArray(messages) ? messages : [],
+        systemPrompt: typeof body.system === "string" ? body.system : null,
+        userPrompt: typeof tdaiUserMessage === "string" ? tdaiUserMessage : null,
+        spaceId,
+      });
+      if (offloadResult?.messages) {
+        messages = offloadResult.messages;
+        body.messages = offloadResult.messages;
+      }
+    } catch (err: unknown) {
+      console.warn(`[offload] anthropic handler error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // ── Cost guard: resolve forward target (opaque — no routing logic here) ──
   // upstream.agents[agent] is a single map keyed by agent name (URL path
   // prefix); both url and apiKey may be overridden per agent. When there's
