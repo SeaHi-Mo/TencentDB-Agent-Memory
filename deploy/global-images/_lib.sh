@@ -19,6 +19,21 @@ ok()   { echo "${C_GRN}[ok]${C_RST} $*"; }
 warn() { echo "${C_YLW}[warn]${C_RST} $*" >&2; }
 die()  { echo "${C_RED}[error]${C_RST} $*" >&2; exit 1; }
 
+# 1/0 → true/false，用于往生成的 YAML 里写布尔字段。
+bool() { [[ "${1:-0}" == "1" ]] && echo "true" || echo "false"; }
+
+# 校验一组变量是正整数。这些值会被直接拼进 YAML 的数字字段，
+# 写进非法值会被 Core 的 num() 静默忽略并回落默认，所以提前拦下来。
+# 未设置 / 空串 → 跳过（调用方用 `${VAR:-default}` 落默认值）。
+require_uint() {
+  local name val
+  for name in "$@"; do
+    val="${!name:-}"
+    [[ -z "$val" ]] && continue
+    [[ "$val" =~ ^[0-9]+$ ]] || die "${name}='${val}' 不是正整数（用于 YAML 数字字段）"
+  done
+}
+
 # 加载 .env（未创建时给指引）
 load_env() {
   if [[ ! -f "$ENV_FILE" ]]; then

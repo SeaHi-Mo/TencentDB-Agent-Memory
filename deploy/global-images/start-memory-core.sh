@@ -127,6 +127,14 @@ rm_container_if_exists "$CONTAINER"
 CORE_CONFIG_DIR="${MEMORY_CORE_CONFIG_DIR:-$SCRIPT_DIR/.memory-core-config}"
 mkdir -p "$CORE_CONFIG_DIR"
 CORE_CONFIG_FILE="$CORE_CONFIG_DIR/tdai-gateway.yaml"
+
+# 下面这些值会被直接拼进 YAML 的数字字段；非法值会被 Core 的 num() 静默忽略并
+# 回落默认（等于旋钮失灵），所以在这里先拦下来。
+require_uint \
+  MEMORY_MAX_MEMORIES_PER_SESSION MEMORY_PERSONA_TRIGGER_EVERY_N MEMORY_PERSONA_MAX_SCENES \
+  MEMORY_L1_EVERY_N MEMORY_L1_IDLE_SECONDS MEMORY_L2_DELAY_AFTER_L1_SECONDS \
+  MEMORY_L2_MIN_INTERVAL_SECONDS MEMORY_L2_MAX_INTERVAL_SECONDS MEMORY_SKILL_TOP_K
+
 info "生成 gateway config → $CORE_CONFIG_FILE"
 cat > "$CORE_CONFIG_FILE" <<YAML
 # 由 start-memory-core.sh 自动生成 —— 每次启动覆盖，请不要手动改。
@@ -155,19 +163,21 @@ memory:
   promptMode: ${MEMORY_PROMPT_MODE:-code}
   capture: { enabled: true }
   extraction:
-    enabled: true
-    enableDedup: true
-    maxMemoriesPerSession: 20
+    enabled: $(bool "${MEMORY_EXTRACTION_ENABLED:-1}")
+    enableDedup: $(bool "${MEMORY_ENABLE_DEDUP:-1}")
+    maxMemoriesPerSession: ${MEMORY_MAX_MEMORIES_PER_SESSION:-20}
   persona:
-    triggerEveryN: 50
-    maxScenes: 15
+    triggerEveryN: ${MEMORY_PERSONA_TRIGGER_EVERY_N:-50}
+    maxScenes: ${MEMORY_PERSONA_MAX_SCENES:-15}
   pipeline:
-    everyNConversations: 5
-    enableWarmup: true
-    l1IdleTimeoutSeconds: 600
-    l2DelayAfterL1Seconds: 90
-    l2MinIntervalSeconds: 900
-    l2MaxIntervalSeconds: 3600
+    # 降本旋钮（默认值 = 历史行为）：调大 everyN / 关 warmup / 调大 idle，
+    # 后台 L1 调用次数按比例下降；persona.triggerEveryN 控制 L3 频率。
+    everyNConversations: ${MEMORY_L1_EVERY_N:-5}
+    enableWarmup: $(bool "${MEMORY_ENABLE_WARMUP:-1}")
+    l1IdleTimeoutSeconds: ${MEMORY_L1_IDLE_SECONDS:-600}
+    l2DelayAfterL1Seconds: ${MEMORY_L2_DELAY_AFTER_L1_SECONDS:-90}
+    l2MinIntervalSeconds: ${MEMORY_L2_MIN_INTERVAL_SECONDS:-900}
+    l2MaxIntervalSeconds: ${MEMORY_L2_MAX_INTERVAL_SECONDS:-3600}
   recall:
     enabled: true
     maxResults: 5
@@ -184,10 +194,11 @@ memory:
 skill:
   enabled: true
   routing:
-    mode: bm25
-    searchTopK: 20
+    # searchTopK 决定 <available_skills> 注入多少条（每条都会进 system prompt）。
+    mode: ${MEMORY_SKILL_ROUTING_MODE:-bm25}
+    searchTopK: ${MEMORY_SKILL_TOP_K:-20}
   extraction:
-    enabled: true
+    enabled: $(bool "${MEMORY_SKILL_EXTRACTION_ENABLED:-1}")
     maxIterations: 16
     queue:
       backend: local

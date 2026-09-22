@@ -236,6 +236,76 @@ gateway_endpoint）就把 `MEMORY_HUB_PROXY_PUBLIC_URL` 显式设为空字符串
 
 `proxy` 默认关闭 `auth` / `sessionInit` / `costGuard`（这些依赖内部服务），只做纯转发 + `tdai-memory` 上下文注入（injector 名称，非容器名）。要开启完整流水线，需要另行配置 —— 参见 `context_proxy/config.example.yaml`。
 
+## 降本与多租户 key
+
+默认部署下所有接入的 agent 共用一把上游 key（`PROXY_UPSTREAM_API_KEY`）。隔离粒度不够时，
+按下面的顺序逐层打开。三层解析优先级（高 → 低）：
+
+1. cost-guard 路由自带凭据（需私有扩展包）
+2. `upstream.agents[<agent>]` —— 客户端族群级，proxy 的 YAML 配置
+3. 实例级上游配置（memory-core 的 `meta_instance_upstream_config`）—— 租户 × 族群 × 用途
+4. `upstream.url` + `upstream.apiKey` —— 全局兜底
+
+> 客户端那把 `sk-mem-...` 本来就是按用户隔离的（`auth/verify` 换 `user_id`）；
+> 这里说的"共用一把 key"指的是**转发给 provider 的那把上游 key**。
+
+### 1. 按客户端族群分 key（改 .env 即可，零代码）
+
+```bash
+# 多条用分号分隔，整行用引号包住；省略 |apiKey 的条目 = 透传客户端自己的 key
+PROXY_UPSTREAM_AGENTS="claude-code=https://api.deepseek.com/v1|sk-aaa"
+```
+
+注意：某族群一旦出现在这张表里，全局 `PROXY_UPSTREAM_API_KEY` 对它就不再兜底。
+把 `PROXY_UPSTREAM_API_KEY` 留空则全局走 BYOK（客户端自带 provider key）。
+
+### 2. 按租户 / 用途分 key（`set-instance-upstream.sh`）
+
+写入 memory-core 的实例级上游配置，proxy 每 5 分钟自动拉取一次（无需重启 proxy）。
+
+| 命令 | 作用 |
+|---|---|
+| `./set-instance-upstream.sh list --space <space>` | 列出该实例的所有覆盖行（key 已脱敏） |
+| `./set-instance-upstream.sh set --space <space> --agent <agent> --type <conversation\|extraction> --mode <official\|custom_unified\|custom_passthrough> --base-url <url> --api-key <key> [--model-id <model>]` | 写入/覆盖一行 |
+| `./set-instance-upstream.sh split --space <space> --conv-url <u> --conv-key <k> --extr-url <u> --extr-key <k>` | 一次配好"对话用贵模型 + 后台抽取用便宜模型" |
+| `./set-instance-upstream.sh reset --space <space> --type <t>` | 恢复 official（conversation）/ 删除该行（extraction） |
+
+要点：
+
+- `--space` 就是请求路径里的 spaceId（如 `/claude-code/<space>`），同时也是 `x-tdai-service-id`；
+- `--agent` 填 URL 路径首段（claude-code / codebuddy / dsh / codex / opencode / pi），
+  填 `default` 表示该实例的兜底行（精确匹配失败时回落）；
+- `extraction` **不支持** `custom_passthrough`（Core 侧会拒绝）：后台抽取必须走服务端 key；
+- 走 custom upstream 时，请求会跳过模型别名改写与 credit 上报；
+- api_key 目前**明文**存在 memory-core 的元数据库里，请确保该库的访问权限可控；
+- 鉴权用 `.admin-key`（system admin）；`--core-url` / `--admin-key` / `--dry-run` 可覆盖默认行为。
+
+### 3. 降本旋钮与预期效果
+
+proxy 侧（`.env`）：
+
+| 变量 | 默认 | 省下的量 |
+|---|---|---|
+| `PROXY_INJECTORS` 去掉 `knowledge` | 全开 | 每请求约 1k - 1.8k tokens |
+| `PROXY_INJECTORS` 去掉 `skill` | 全开 | 每请求约 1.8k - 3.7k tokens |
+| `PROXY_INJECTORS` 留空 | 全开 | 关闭全部注入，省约 4k - 10k tokens/请求 |
+| `PROXY_EXTRACTION_ENABLED=0` | 开 | 后台回流/归档归零 |
+
+memory 侧（`.env`，只改频率不改功能）：
+
+| 变量 | 默认 | 调到 | 预期效果 |
+|---|---|---|---|
+| `MEMORY_L1_EVERY_N` | 5 | 20 | L1 抽取调用次数约 -75% |
+| `MEMORY_ENABLE_WARMUP` | 1 | 0 | 长会话更快进入低频（前期调用变少） |
+| `MEMORY_L2_MAX_INTERVAL_SECONDS` | 3600 | 21600 | L2 场景重建约 -83% |
+| `MEMORY_PERSONA_TRIGGER_EVERY_N` | 50 | 200 | L3 persona 重建约 -75% |
+| `MEMORY_SKILL_TOP_K` | 20 | 6 | `<available_skills>` 注入量约 -70% |
+| `MEMORY_LLM_MODEL` | - | 便宜模型 | **单项收益最大**：后台管线全部走它 |
+
+最省事的组合：`MEMORY_LLM_MODEL` 指向便宜模型 + `MEMORY_L1_EVERY_N=20` +
+`PROXY_INJECTORS=skill,tdai-memory`。想量化真实用量请先打开用量统计
+（`CLICKHOUSE_ENABLED=1`，需要一个 ClickHouse 实例），否则没有任何数据支撑判断。
+
 ## 常见问题
 
 **Q: `./start-all.sh` 卡在 wait_healthy？**

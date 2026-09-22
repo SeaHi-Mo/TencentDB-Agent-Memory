@@ -19,7 +19,19 @@ source "$SCRIPT_DIR/_lib.sh"
 load_env
 require_vars \
   PROXY_IMAGE PROXY_PORT \
-  PROXY_UPSTREAM_URL PROXY_UPSTREAM_API_KEY PROXY_UPSTREAM_MODEL
+  PROXY_UPSTREAM_URL PROXY_UPSTREAM_MODEL
+
+# PROXY_UPSTREAM_API_KEY 允许留空 —— 留空 / REPLACE_ME 时上游鉴权透传客户端
+# 请求里自带的 key（BYOK），proxy 不再用服务端统一 key 覆盖。
+# 见 config.example.yaml `upstream` 段：apiKey 为空即 passthrough。
+PROXY_UPSTREAM_API_KEY="${PROXY_UPSTREAM_API_KEY:-}"
+if [[ "$PROXY_UPSTREAM_API_KEY" == "REPLACE_ME" ]]; then
+  warn "PROXY_UPSTREAM_API_KEY 仍是 REPLACE_ME，按留空处理（透传客户端自带 key）"
+  PROXY_UPSTREAM_API_KEY=""
+fi
+if [[ -z "$PROXY_UPSTREAM_API_KEY" ]]; then
+  warn "PROXY_UPSTREAM_API_KEY 为空 → 上游鉴权走透传（BYOK）：客户端必须在 Authorization / x-api-key 里带自己的 provider key。"
+fi
 
 # 与 memory-core 保持一致的 gateway 内部凭据（默认 local，仅本地体验）
 MEMORY_CORE_GATEWAY_API_KEY="${MEMORY_CORE_GATEWAY_API_KEY:-local}"
@@ -77,7 +89,108 @@ PROXY_ENABLE_SKILL_WRITE="${PROXY_ENABLE_SKILL_WRITE:-0}"
 
 bool() { [[ "$1" == "1" ]] && echo "true" || echo "false"; }
 
-info "生成 proxy config → $CONFIG_FILE  (auth=$(bool $PROXY_ENABLE_AUTH) session-init=$(bool $PROXY_ENABLE_SESSION_INIT) tdai=$(bool $PROXY_ENABLE_TDAI) skill-write=$(bool $PROXY_ENABLE_SKILL_WRITE))"
+# ── YAML 小工具 ─────────────────────────────────────────────────────────────
+# 双引号标量转义：先转义反斜杠，再转义双引号（顺序不能反）。
+yaml_quote() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+# ── Per-agent 上游覆盖（可选）───────────────────────────────────────────────
+# PROXY_UPSTREAM_AGENTS 格式（多条用 `;` 分隔，字段用 `|` 分隔）：
+#
+#   <agent>=<url>|<apiKey>
+#   <agent>=<url>              # 不带 key → 该 agent 透传客户端自己的 key
+#
+# 例：
+#   PROXY_UPSTREAM_AGENTS="claude-code=https://api.deepseek.com/v1|sk-aaa;\
+#                          codebuddy=https://api.moonshot.cn/v1|sk-bbb"
+#
+# 语义与 MemoryProxy/src/types.ts 的 AgentUpstreamEntry 完全一致：一旦某个
+# agent 出现在这张表里，全局 upstream.apiKey 的兜底就被切断（要么用这里配的
+# key，要么透传客户端 key）。收益：按客户端族群隔离额度 / 单独限流 / 单独看账。
+UPSTREAM_AGENTS_YAML=""
+render_upstream_agents() {
+  local spec="${PROXY_UPSTREAM_AGENTS:-}"
+  [[ -z "$spec" ]] && return 0
+  local entries=() entry agent rest url apikey
+  IFS=';' read -r -a entries <<< "$spec"
+  local rendered=""
+  for entry in "${entries[@]}"; do
+    # 去掉首尾空白
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    [[ -z "$entry" ]] && continue
+    if [[ "$entry" != *"="* ]]; then
+      warn "PROXY_UPSTREAM_AGENTS 条目缺少 '='，已跳过：$entry"
+      continue
+    fi
+    agent="${entry%%=*}"
+    rest="${entry#*=}"
+    agent="${agent//[[:space:]]/}"
+    url="${rest%%|*}"
+    if [[ "$rest" == *"|"* ]]; then
+      apikey="${rest#*|}"
+    else
+      apikey=""
+    fi
+    if [[ -z "$agent" || -z "$url" ]]; then
+      warn "PROXY_UPSTREAM_AGENTS 条目 agent/url 为空，已跳过：$entry"
+      continue
+    fi
+    rendered+="    $(yaml_quote "$agent"):"$'\n'
+    rendered+="      url: $(yaml_quote "$url")"$'\n'
+    if [[ -n "$apikey" ]]; then
+      rendered+="      apiKey: $(yaml_quote "$apikey")"$'\n'
+    fi
+    if [[ -z "$apikey" ]]; then
+      info "  upstream.agents.${agent} → ${url}（透传客户端 key）"
+    else
+      info "  upstream.agents.${agent} → ${url}（服务端 key）"
+    fi
+  done
+  if [[ -n "$rendered" ]]; then
+    UPSTREAM_AGENTS_YAML="  agents:"$'\n'"$rendered"
+  fi
+}
+render_upstream_agents
+
+# ── 降本开关（全部可选；不设时行为与历史完全一致）─────────────────────────
+# PROXY_INJECTORS：逗号分隔的注入器白名单。默认三个全开。
+#   关掉 knowledge / skill 能显著压低每请求 input token（见 README「降本」段）。
+PROXY_INJECTORS="${PROXY_INJECTORS:-skill,knowledge,tdai-memory}"
+PROXY_INJECTION_ENABLED="${PROXY_INJECTION_ENABLED:-1}"
+INJECTORS_YAML=""
+_inj_trimmed="$(printf '%s' "$PROXY_INJECTORS" | tr -d '[:space:]')"
+if [[ -z "$_inj_trimmed" ]]; then
+  PROXY_INJECTION_ENABLED=0
+  warn "PROXY_INJECTORS 为空 → 关闭上下文注入（injection.enabled=false）"
+else
+  IFS=',' read -r -a _inj_list <<< "$PROXY_INJECTORS"
+  for _inj in "${_inj_list[@]}"; do
+    _inj="${_inj//[[:space:]]/}"
+    [[ -z "$_inj" ]] && continue
+    INJECTORS_YAML+="    - ${_inj}"$'\n'
+  done
+fi
+
+# PROXY_ASSET_REFLECTION=0 → 关掉 /analyse marker 下的 <asset_reflection> 块
+# （内部效果评估用；开着会让模型在最终回答末尾追加一段复盘）。
+PROXY_ASSET_REFLECTION="${PROXY_ASSET_REFLECTION:-1}"
+
+# PROXY_EXTRACTION_ENABLED / PROXY_EXTRACTORS：写侧（对话回流内核）。
+# 关掉 = 完全不写 L0 / 不归档 skill，后台抽取成本归零，但记忆也不再增长。
+EXTRACTION_YAML=""
+if [[ -n "${PROXY_EXTRACTION_ENABLED:-}" || -n "${PROXY_EXTRACTORS:-}" ]]; then
+  EXTRACTION_YAML="extraction:
+  enabled: $(bool "${PROXY_EXTRACTION_ENABLED:-1}")
+  extractors: [${PROXY_EXTRACTORS:-skill,tdai-memory}]
+"
+fi
+
+info "生成 proxy config → $CONFIG_FILE  (auth=$(bool $PROXY_ENABLE_AUTH) session-init=$(bool $PROXY_ENABLE_SESSION_INIT) tdai=$(bool $PROXY_ENABLE_TDAI) skill-write=$(bool $PROXY_ENABLE_SKILL_WRITE) injectors=${PROXY_INJECTORS:-none})"
 cat > "$CONFIG_FILE" <<YAML
 # 由 start-proxy.sh 自动生成 —— 每次启动覆盖，请不要手动改。
 server:
@@ -88,6 +201,7 @@ server:
 upstream:
   url: "${PROXY_UPSTREAM_URL}"
   apiKey: "${PROXY_UPSTREAM_API_KEY}"
+${UPSTREAM_AGENTS_YAML}
 
 log:
   file: ""
@@ -140,20 +254,24 @@ sessionInit:
 costGuard:
   enabled: false
 
-# 打开 skill + knowledge + tdai-memory 三个注入器；
+# 注入器白名单由 .env 的 PROXY_INJECTORS 控制（默认三个全开）。
 # knowledge 依赖 memory-hub 起来，否则 hook 内部会降级为空块。
+# 降本提示：每请求注入的 system 块约 4k–10k tokens，去掉 knowledge 省 ~1k–1.8k，
+# 去掉 skill 省 ~1.8k–3.7k（详见 deploy/global-images/README.md「降本」段）。
 injection:
-  enabled: true
+  enabled: $(bool "$PROXY_INJECTION_ENABLED")
   injectors:
-    - skill
-    - knowledge
-    - tdai-memory
+${INJECTORS_YAML}  assetReflection:
+    markerOptIn: $(bool "$PROXY_ASSET_REFLECTION")
 
 # skill-bridge 的写权限：false 时 patch / create / update / delete / files-write 一律 40302。
 # 打开后主模型可直接创建、修改 skill（见 MemoryProxy/config.example.yaml skillRuntime）。
 skillRuntime:
   allowLlmWrite: $(bool $PROXY_ENABLE_SKILL_WRITE)
 
+# 写侧（对话回流内核 + skill 归档）。只有显式设置 PROXY_EXTRACTION_ENABLED /
+# PROXY_EXTRACTORS 时才写这一段，未设置时沿用镜像内默认（enabled=true）。
+${EXTRACTION_YAML}
 redis:
   enabled: false
 YAML
