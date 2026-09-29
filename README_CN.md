@@ -328,7 +328,7 @@ TencentDB Agent Memory 的设计站在开源社区的肩膀上：
 - 🛠️ **想贡献代码？** 请先阅读 [CONTRIBUTING.md](./CONTRIBUTING_CN.md)。
 - ☁️ **云上托管版**已正式上线，诚邀体验，如有使用意向，请填写问卷，我们后续会尽快联系您：**[填写问卷](https://wj.qq.com/s2/27892273/3h5k/)**
 - 💬 **想加入交流群？** 扫码加入 **Agent Memory 微信社群**，与早期开发者直接对话。
-<p align="center"><img src="https://github.com/user-attachments/assets/0e612941-a4ad-423b-a536-13dbdebef66e" width="200" alt="Agent Memory 微信社群二维码" />
+<p align="center"><img src="https://github.com/user-attachments/assets/e57ae607-0392-47c4-b10a-fb19296e2332" width="200" alt="Agent Memory 微信社群二维码" />
 
 ---
 
@@ -372,8 +372,8 @@ TencentDB Agent Memory 的设计站在开源社区的肩膀上：
 ## Star 趋势
 
 <p align="center">
-  <a href="https://www.star-history.com/#Tencent/TencentDB-Agent-Memory&Date">
-    <img src="https://github.com/user-attachments/assets/9fa25730-d82e-4631-9f4e-1ab6918755e2" alt="Star History Chart" width="600" />
+  <a href="https://star-history.dera.page/#TencentCloud/TencentDB-Agent-Memory&Date">
+    <img src="https://star-history.dera.page/svg?repos=TencentCloud/TencentDB-Agent-Memory&type=Date" alt="Star History Chart" width="600" />
   </a>
 </p>
 
