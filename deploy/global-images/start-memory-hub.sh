@@ -85,6 +85,31 @@ rm_container_if_exists "$CONTAINER"
 
 # 内部 knowledge 通过 upstream memory 调 LLM 走 custom 模式，直接指向 MEMORY_LLM_*
 # LLM_MODE=custom → 不走 memory 的 LLM proxy，而是 knowledge 直连用户提供的端点
+# ClickHouse 用量埋点 —— Knowledge 既是 tool_call_logs 的**写入方**（wiki /
+# code-graph 工具调用），也是 /v3/analytics/* 的**查询方**。三处指针必须一致。
+# KNOWLEDGE_ANALYTICS_ADMIN_KEY 留空时 /v3/analytics/* 返回 503，Panel 会把
+# wiki / code-graph 图表标成 "Not enabled"（/config 探针仍可用）。
+KNOWLEDGE_CH_ENV_ARGS=()
+if [[ "${CLICKHOUSE_ENABLED:-0}" == "1" ]]; then
+  ADMIN_KEY_FILE="${MEMORY_CORE_ADMIN_KEY_FILE:-$SCRIPT_DIR/.admin-key}"
+  _knowledge_analytics_key=""
+  if [[ -s "$ADMIN_KEY_FILE" ]]; then
+    _knowledge_analytics_key="$(cat "$ADMIN_KEY_FILE")"
+  else
+    warn "未找到 $ADMIN_KEY_FILE：KNOWLEDGE_ANALYTICS_ADMIN_KEY 留空，Knowledge 的 /v3/analytics/* 将返回 503。"
+  fi
+  KNOWLEDGE_CH_ENV_ARGS+=(
+    -e KNOWLEDGE_CLICKHOUSE_ENABLED=true
+    -e "KNOWLEDGE_CLICKHOUSE_URL=http://${CLICKHOUSE_HOST:-clickhouse}:8123"
+    -e "KNOWLEDGE_CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-context_proxy}"
+    -e KNOWLEDGE_CLICKHOUSE_TABLE=tool_call_logs
+    -e "KNOWLEDGE_CLICKHOUSE_USER=${CLICKHOUSE_USER:-tdai}"
+    -e "KNOWLEDGE_CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}"
+    -e "KNOWLEDGE_ANALYTICS_ADMIN_KEY=${_knowledge_analytics_key}"
+  )
+  info "已启用 Knowledge ClickHouse 埋点 + analytics 查询"
+fi
+
 info "启动 memory-hub (image=$MEMORY_HUB_IMAGE, panel=$PANEL_PORT knowledge=$KNOWLEDGE_PORT)"
 $DOCKER run -d --name "$CONTAINER" \
   --network "$NETWORK" \
@@ -107,6 +132,7 @@ $DOCKER run -d --name "$CONTAINER" \
   -e LLM_BASE_URL="$MEMORY_LLM_BASE_URL" \
   -e LLM_MODEL="$MEMORY_LLM_MODEL" \
   -e KNOWLEDGE_LLM_BINDING_SYNC=0 \
+  ${KNOWLEDGE_CH_ENV_ARGS[@]+"${KNOWLEDGE_CH_ENV_ARGS[@]}"} \
   "$MEMORY_HUB_IMAGE" >/dev/null
 
 wait_healthy "$CONTAINER" 120

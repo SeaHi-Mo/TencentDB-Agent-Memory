@@ -43,6 +43,16 @@ require_vars \
 # 避免拉起 memory 之后才发现 hub/proxy 端口冲突。（会排除 tdai 自己旧容器）
 check_ports
 
+# 可选：用量统计（Analytics）的 ClickHouse 数据落点。CLICKHOUSE_ENABLED=1 后，
+# 三件套分别以「Proxy 写 / Knowledge 写+查 / Core 查」的角色指向同一个实例；
+# CLICKHOUSE_LOCAL=1 表示这个实例由本部署自己起（已在跑则复用）。详见 README「用量统计」。
+if [[ "${CLICKHOUSE_ENABLED:-0}" == "1" && "${CLICKHOUSE_LOCAL:-0}" == "1" ]]; then
+  info "═══ Step 0/3: clickhouse（用量统计，可选）═══════════════════"
+  "$SCRIPT_DIR/start-clickhouse.sh"
+elif [[ "${CLICKHOUSE_ENABLED:-0}" == "1" ]]; then
+  info "ClickHouse 指向外部实例 http://${CLICKHOUSE_HOST:-clickhouse}:8123（CLICKHOUSE_LOCAL!=1，不本地起容器）"
+fi
+
 info "═══ Step 1/3: memory ═══════════════════════════════════════"
 "$SCRIPT_DIR/start-memory-core.sh"
 

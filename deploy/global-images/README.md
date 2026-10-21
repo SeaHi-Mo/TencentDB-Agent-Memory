@@ -68,6 +68,69 @@ cd TencentDB-Agent-Memory/deploy/global-images
   自行备份并手工迁移；后续版本将提供官方迁移工具。L2/L3 文件两种模式都在
   `MEMORY_CORE_VOLUME` 卷。
 
+### 用量统计 Analytics（可选，默认关闭）
+
+默认**不开**：Proxy 每次调用的 token 用量、memory/skill/wiki/code-graph 的工具调用
+记录都会落空，Panel 的 Analytics 页显示 "Not enabled"。开启需要一个 ClickHouse 作为
+数据落点，四个角色分工如下（详见 `INSTALL.md` 的 Analytics 一节）：
+
+| 角色 | 服务 | 干什么 |
+|---|---|---|
+| 写 | **Proxy** | `usage_logs`（每次 LLM 调用的 token 用量）+ `tool_call_logs` |
+| 写 | **Knowledge**（在 memory-hub 内） | `tool_call_logs`（wiki / code-graph 工具调用） |
+| 读 | **Core** | `/v3/analytics/*` 聚合查询 |
+| 渲染 | **Panel** | 启动时探 `/v3/analytics/config`，`configured:true` 才画图 |
+
+本机一键开启（`.env` 里两个开关，配合 `start-clickhouse.sh` 起一个本地 CH）：
+
+```bash
+CLICKHOUSE_ENABLED=1    # 三处接线（写 + 查）
+CLICKHOUSE_LOCAL=1      # 这个 CH 由本部署自己起（start-all.sh 会拉起容器）
+```
+
+```bash
+./start-all.sh          # CLICKHOUSE_LOCAL=1 时会先跑 Step 0/3 起 clickhouse
+./start-clickhouse.sh   # 也可以单独起（已在跑会先删旧容器再重建，数据卷保留）
+```
+
+- **三处指针必须一致**：Proxy 的 `clickhouse.url`、Knowledge 的
+  `KNOWLEDGE_CLICKHOUSE_URL`、Core 的 `ANALYTICS_CLICKHOUSE_ENDPOINT` 都指向同一实例
+  （本机统一是 `http://clickhouse:8123`，由 `CLICKHOUSE_HOST` 控制）。Core 指错时
+  表现为「Proxy 在收请求，但 Panel 里一条都没有」；
+- 表结构**不用手工建**：Proxy / Knowledge 首次写入时自动 `CREATE TABLE IF NOT EXISTS`；
+- CH 的 HTTP 端口只发布到 `127.0.0.1:${CLICKHOUSE_HTTP_PORT:-18123}`（本机调试用），
+  容器之间走 `8123`；
+- **账号密码不是可选的**：官方镜像只有在 `CLICKHOUSE_USER`（且非 `default`）或
+  `CLICKHOUSE_PASSWORD` 至少一个非空时才放开网络访问，两者都空会把用户限制成
+  「只能从 localhost 连」→ 容器外的三件套全部 `Authentication failed`。
+  `start-clickhouse.sh` 因此固定用 `CLICKHOUSE_USER=tdai`（把 `default` 自动归一成
+  `tdai`），密码留空则首次运行随机生成并写回 `.env`；**改了密码要重跑三件套的
+  `start-*.sh`** 才会同步；
+- 想用现成的外部 CH：只设 `CLICKHOUSE_ENABLED=1` + `CLICKHOUSE_HOST=<host>`，
+  不要设 `CLICKHOUSE_LOCAL`，本部署就不会起容器；
+- 清数据：`./stop-all.sh --purge` 会连 `tdai-clickhouse-data` 卷一起删。
+
+排查顺序（本机实测踩过坑，按此序最快）：
+
+- `docker logs tdai-proxy | grep clickhouse` 出现
+  `clickhouse.init.ensureFailed ... Authentication failed` → **鉴权问题**：三处用的
+  账号密码跟 CH 容器里的不一致（改过 `CLICKHOUSE_PASSWORD` 后没重跑三件套最常见）；
+- ⚠️ `connectivity.check` 里的 `"clickhouse":"ok"` **不代表鉴权通过** —— 它只打
+  HTTP `/ping`（不需要认证），所以「日志说 ok、表里却没数据」时别被它误导，要看
+  `init.ensureFailed` 和 `/v3/analytics/config` 的 `tables`；
+- `configured:false` → 该服务的 CH 配置没生效（Core 看 `ANALYTICS_CLICKHOUSE_*`、
+  Knowledge 看 `KNOWLEDGE_CLICKHOUSE_*`），重跑对应的 `start-*.sh`；
+- `configured:true, reachable:false` → 网络/鉴权不通，先按第一条查密码；
+
+自检两条（都应为 `configured: true`）：
+
+```bash
+KEY=$(cat ./.admin-key)
+curl -s http://localhost:8420/v3/analytics/config -H "x-tdai-service-id: default" \
+  -H "x-tdai-user-key: $KEY" | jq
+curl -s http://localhost:8424/v3/analytics/config -H "x-tdai-service-id: default" | jq
+```
+
 ### 干跑校验（可选）
 
 `verify.sh` 仍可单独使用，只检查环境不启动容器：

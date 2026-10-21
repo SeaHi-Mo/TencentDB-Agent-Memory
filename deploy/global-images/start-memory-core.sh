@@ -211,6 +211,21 @@ skill:
     maxResourceSizeBytes: 5000000
 YAML
 
+# ClickHouse analytics —— Core 是**读取方**（/v3/analytics/*），必须指向 Proxy 写入的
+# 同一个实例，否则 Panel 的用量/工具调用图表拿不到数据（见 INSTALL.md「Analytics」）。
+# 走 ANALYTICS_CLICKHOUSE_* 环境变量，优先级高于 tdai-gateway.yaml 的 analytics.clickhouse。
+ANALYTICS_ENV_ARGS=()
+if [[ "${CLICKHOUSE_ENABLED:-0}" == "1" ]]; then
+  ANALYTICS_ENV_ARGS+=(
+    -e ANALYTICS_CLICKHOUSE_ENABLED=true
+    -e "ANALYTICS_CLICKHOUSE_ENDPOINT=http://${CLICKHOUSE_HOST:-clickhouse}:8123"
+    -e "ANALYTICS_CLICKHOUSE_USERNAME=${CLICKHOUSE_USER:-tdai}"
+    -e "ANALYTICS_CLICKHOUSE_PASSWORD=${CLICKHOUSE_PASSWORD:-}"
+    -e "ANALYTICS_CLICKHOUSE_DATABASE=${CLICKHOUSE_DATABASE:-context_proxy}"
+  )
+  info "已启用 ClickHouse analytics 查询（endpoint=http://${CLICKHOUSE_HOST:-clickhouse}:8123, db=${CLICKHOUSE_DATABASE:-context_proxy}）"
+fi
+
 info "启动 memory-core (image=$MEMORY_CORE_IMAGE, port=$MEMORY_CORE_PORT)"
 $DOCKER run -d --name "$CONTAINER" \
   --network "$NETWORK" \
@@ -224,6 +239,7 @@ $DOCKER run -d --name "$CONTAINER" \
   -e TDAI_DATA_DIR=/data/tdai-memory \
   -e STORE_MODE="$MEMORY_CORE_STORE_MODE" \
   ${MONGO_ENV_ARGS[@]+"${MONGO_ENV_ARGS[@]}"} \
+  ${ANALYTICS_ENV_ARGS[@]+"${ANALYTICS_ENV_ARGS[@]}"} \
   "$MEMORY_CORE_IMAGE" >/dev/null
 
 wait_healthy "$CONTAINER" 90

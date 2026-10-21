@@ -48,7 +48,23 @@ import type { TeamOption } from "../types.js";
 
 /** dsh 原生 tool 名。**不要**改成 CC 的 `AskUserQuestion`——dsh preset 挂的是 snake_case。 */
 export const TOOL_NAME = "ask_user_question";
+/** OpenAI 协议下的 tool_call id 前缀。 */
 export const TOOLCALL_PREFIX = "call_dsh_session_init_";
+/**
+ * Anthropic Messages 协议下的 tool_use id 前缀。
+ *
+ * dsh 0.1.6-alpha.1 起 `llm-deepseek.protocol` 默认值变成 `messages`：
+ * 请求 `${baseURL}/v1/messages`，响应按 Anthropic 形状解析 —— 解析器
+ * （dsh-llm-deepseek `lib/index.js` 的 `parseSse`）要求每一帧的 `event:` 名
+ * 与 `data.type` **严格相等**，且 `data.type` 必须是字符串。拿到 OpenAI
+ * 形状的帧（`data: {object:"chat.completion.chunk",…}`，无 `type` 字段）会
+ * 直接抛 `DeepSeek Messages SSE event type mismatch` / MALFORMED_RESPONSE，
+ * 一个回合都起不来。
+ *
+ * 因此本 form 必须按请求协议出两种形状；messages 分支的每一帧都保证
+ * `event:` 与 `type` 同值（见 buildAnthropicStreamingResponse）。
+ */
+export const TOOLUSE_PREFIX = "toolu_dsh_session_init_";
 
 export const TEAM_FORM_TITLE = "会话初始化 — 选择 Team";
 export const AGENT_TASK_FORM_TITLE = "会话初始化 — 选择 Agent 与任务";
@@ -100,9 +116,13 @@ export function containsFormTitle(s: string): boolean {
   );
 }
 
-/** Returns true if a tool_call id belongs to a dsh session-init form. */
+/**
+ * Returns true if a tool_call / tool_use id belongs to a dsh session-init form.
+ * 两种协议各有一套前缀：OpenAI 用 `call_dsh_session_init_`，
+ * Anthropic Messages 用 `toolu_dsh_session_init_`。
+ */
 export function isSessionInitToolCallId(id: string): boolean {
-  return id.startsWith(TOOLCALL_PREFIX);
+  return id.startsWith(TOOLCALL_PREFIX) || id.startsWith(TOOLUSE_PREFIX);
 }
 
 // ── Form Data ──────────────────────────────────────────────────────────────────
@@ -119,6 +139,12 @@ export interface FormData {
   retry?: boolean;
   stream?: boolean;
   modelId?: string;
+  /**
+   * 请求所用的线协议。dsh 的 `llm-deepseek.protocol` 默认已是 `messages`，
+   * 部署也可以 pin 成 `chat-completions`；两种都必须能出正确的 form 形状。
+   * 由 CB 状态机从 `reqCtx.protocol` 透传（见 session/index.ts 的 dsh 重渲染）。
+   */
+  protocol?: "openai" | "anthropic";
 }
 
 // ── ask_user_question input schema (dsh snake_case + 必填 id) ──────────────────
@@ -248,10 +274,22 @@ function buildAskUserQuestionArgs(data: FormData): { questions: DshAskQuestion[]
 export function buildFormResponse(data: FormData): Response {
   const model = data.modelId ?? "unknown";
   const created = Math.floor(Date.now() / 1000);
-  const id = "dsh-session-init-" + Date.now();
-  const toolCallId = TOOLCALL_PREFIX + Date.now();
   const input = buildAskUserQuestionArgs(data);
   const argsStr = JSON.stringify(input);
+
+  // Anthropic Messages 协议：`event:` 与 `data.type` 必须逐帧同值，
+  // 否则 dsh 的 Messages 解析器直接判 MALFORMED_RESPONSE（见 TOOLUSE_PREFIX 注释）。
+  if (data.protocol === "anthropic") {
+    const msgId = "msg_dsh_session_init_" + Date.now();
+    const toolUseId = TOOLUSE_PREFIX + Date.now();
+    if (data.stream) {
+      return buildAnthropicStreamingResponse(msgId, model, toolUseId, input);
+    }
+    return buildAnthropicNonStreamingResponse(msgId, model, toolUseId, input);
+  }
+
+  const id = "dsh-session-init-" + Date.now();
+  const toolCallId = TOOLCALL_PREFIX + Date.now();
 
   if (data.stream) {
     return buildOpenAIStreamingResponse(id, created, model, toolCallId, argsStr);
@@ -359,6 +397,109 @@ function buildOpenAIStreamingResponse(
       })}\n\n`));
 
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" },
+  });
+}
+
+// ── Anthropic Messages Non-streaming ───────────────────────────────────────────
+
+function buildAnthropicNonStreamingResponse(
+  msgId: string,
+  model: string,
+  toolUseId: string,
+  input: { questions: DshAskQuestion[] },
+): Response {
+  return new Response(JSON.stringify({
+    id: msgId,
+    type: "message",
+    role: "assistant",
+    model,
+    content: [{
+      type: "tool_use",
+      id: toolUseId,
+      name: TOOL_NAME,
+      input,
+    }],
+    stop_reason: "tool_use",
+    stop_sequence: null,
+    usage: { input_tokens: 0, output_tokens: 0 },
+  }), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+// ── Anthropic Messages Streaming ───────────────────────────────────────────────
+
+/**
+ * 生成 dsh Messages 解析器能吃的 SSE（Anthropic 形状）。
+ *
+ * 帧序是 dsh `messages/translate` 的硬要求，违反即 MALFORMED_RESPONSE：
+ *   message_start → content_block_start(index 0, tool_use) → content_block_delta
+ *   (input_json_delta) → content_block_stop → message_delta(stop_reason=tool_use)
+ *   → message_stop
+ *
+ * 三条形状约束（对应 dsh 侧 `startBlock` / `deltaChunk` / `stopReason`）：
+ *   1. 每帧 `event:` 名与 `data.type` **同值** —— `parseSse` 逐帧比对，不等即抛
+ *      `DeepSeek Messages SSE event type mismatch`。
+ *   2. `content_block_start.content_block` 的 `id` / `name` 必须非空，`input`
+ *      必须是对象（空对象即可），否则 `malformed("empty tool identity")` 或
+ *      `object()` 校验失败。完整入参放 `input_json_delta.partial_json`。
+ *   3. `message_delta.delta.stop_reason` 只认 end_turn / stop_sequence /
+ *      tool_use / max_tokens，这里必须是 `tool_use`（映射为 tool-calls）。
+ *
+ * 有意**不**发 thinking block：OpenAI 分支必须塞非空 reasoning_content
+ * （见 REASONING_PLACEHOLDER 定义），但 Messages 协议的对应物是带 signature 的
+ * thinking block —— dsh 侧 signature 可选（`block.signature !== void 0` 才校验），
+ * 而伪造 signature 有被上游拒收的风险，因此不做，交由部署 pin
+ * `chat-completions` 或上游真实响应。
+ */
+function buildAnthropicStreamingResponse(
+  msgId: string,
+  model: string,
+  toolUseId: string,
+  input: { questions: DshAskQuestion[] },
+): Response {
+  const encoder = new TextEncoder();
+  const inputJson = JSON.stringify(input);
+  const sse = (event: string, d: unknown) =>
+    encoder.encode(`event: ${event}\ndata: ${JSON.stringify(d)}\n\n`);
+
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(sse("message_start", {
+        type: "message_start",
+        message: {
+          id: msgId, type: "message", role: "assistant", model,
+          content: [], stop_reason: null, stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      }));
+
+      controller.enqueue(sse("content_block_start", {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "tool_use", id: toolUseId, name: TOOL_NAME, input: {} },
+      }));
+
+      controller.enqueue(sse("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "input_json_delta", partial_json: inputJson },
+      }));
+
+      controller.enqueue(sse("content_block_stop", { type: "content_block_stop", index: 0 }));
+
+      controller.enqueue(sse("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: "tool_use", stop_sequence: null },
+        usage: { output_tokens: 0 },
+      }));
+
+      controller.enqueue(sse("message_stop", { type: "message_stop" }));
       controller.close();
     },
   });

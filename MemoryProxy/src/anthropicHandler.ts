@@ -317,6 +317,50 @@ export function sanitizeThinkingBlocks(
 }
 
 /**
+ * Upstreams whose Anthropic-compatible endpoint does **not** sign `thinking`
+ * blocks but still requires them back verbatim on the next request. DeepSeek's
+ * `/anthropic/v1` is the one in use here: its 400 is literally
+ * `The content[].thinking in the thinking mode must be passed back to the API`,
+ * so the signature heuristic below must not strip them.
+ */
+/**
+ * DeepSeek's anthropic endpoint requires every assistant turn to carry a
+ * `thinking` block while thinking is on, and the session-init forms this proxy
+ * emits carry only `tool_use`. Fill those in with a placeholder — the same
+ * trick the OpenAI branch already uses for `reasoning_content` — while leaving
+ * real thinking blocks untouched.
+ */
+function ensureThinkingPlaceholders(
+  body: Record<string, unknown>,
+): Record<string, unknown> {
+  const thinking = (body as { thinking?: { type?: unknown } }).thinking;
+  if (thinking?.type !== "enabled") return body;
+  const messages = body.messages;
+  if (!Array.isArray(messages)) return body;
+
+  let changed = false;
+  const next = messages.map((msg) => {
+    const m = msg as Record<string, unknown>;
+    if (m.role !== "assistant" || !Array.isArray(m.content)) return msg;
+    const content = m.content as Array<Record<string, unknown>>;
+    if (content.some((b) => b?.type === "thinking" || b?.type === "redacted_thinking")) return msg;
+    if (!content.some((b) => b?.type === "tool_use")) return msg;
+    changed = true;
+    return { ...m, content: [{ type: "thinking", thinking: "[proxy session-init placeholder]" }, ...content] };
+  });
+  return changed ? { ...body, messages: next } : body;
+}
+
+function keepsUnsignedThinking(upstreamUrl: string | undefined): boolean {
+  if (!upstreamUrl) return false;
+  try {
+    return new URL(upstreamUrl).hostname.endsWith("deepseek.com");
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Build upstream body from original body + cost guard overrides.
  */
 function buildUpstreamBody(
@@ -326,6 +370,10 @@ function buildUpstreamBody(
   let result = body;
   if (target.bodyOverrides) {
     result = { ...result, ...target.bodyOverrides };
+  }
+  // DeepSeek's Anthropic endpoint signs nothing and wants the thinking back.
+  if (keepsUnsignedThinking(target.url)) {
+    return { body: ensureThinkingPlaceholders(result), sanitizedCount: 0 };
   }
   const sanitized = sanitizeThinkingBlocks(result);
   return { body: sanitized.body, sanitizedCount: sanitized.removed };
@@ -1464,7 +1512,9 @@ export async function handleAnthropicMessages(
     delete originalHeaders["authorization"];
   }
 
-  const retryBody = sanitizeThinkingBlocks(body).body;
+  const retryBody = keepsUnsignedThinking(target.url)
+    ? ensureThinkingPlaceholders(body)
+    : sanitizeThinkingBlocks(body).body;
 
   // ── Forward to upstream (with automatic retry if configured) ──────────────
   const forwardTimeoutMs = config.server.forwardTimeoutMs ?? 600_000;

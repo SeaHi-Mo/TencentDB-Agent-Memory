@@ -215,6 +215,13 @@ export async function handleSessionInit(
       retry: cbFd.retry,
       stream: reqCtx.stream,
       modelId: reqCtx.modelId,
+      // 必须透传协议：dsh 0.1.6-alpha.1 起 `llm-deepseek.protocol` 默认
+      // `messages`（`${baseURL}/v1/messages` + Anthropic 形状 SSE）。漏传会让
+      // 走 messages 的客户端（官方 web surface）收到 OpenAI 形状的
+      // `chat.completion.chunk` 帧，dsh 的 Messages 解析器在首帧就抛
+      // "DeepSeek Messages SSE event type mismatch"（MALFORMED_RESPONSE），
+      // 一个回合都起不来。dsh/form.ts 按此字段出对应形状。
+      protocol: reqCtx.protocol,
     };
     result.response = buildDshFormResponse(dshFd);
   }

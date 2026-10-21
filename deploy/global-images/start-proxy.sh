@@ -224,6 +224,20 @@ if [[ "$PROXY_OFFLOAD_ENABLED" == "1" ]]; then
   info "  context offload → level=${PROXY_OFFLOAD_LEVEL} trigger=${PROXY_OFFLOAD_TRIGGER_TOKENS}tok cooldown=${PROXY_OFFLOAD_COOLDOWN_TURNS}轮 dryRun=$(bool "$PROXY_OFFLOAD_DRYRUN")"
 fi
 
+# Anthropic 协议专用上游（可选）。dsh 0.1.7 的 @deepseek-ai/dsh-llm-deepseek
+# 只说 Messages 线（POST ${baseURL}/v1/messages），而 DeepSeek 官方 API 的
+# Anthropic 兼容入口是 https://api.deepseek.com/anthropic/v1；不设这一项时
+# Anthropic 请求会落到 upstream.url（OpenAI 形状）并 404。
+ANTHROPIC_UPSTREAM_YAML=""
+if [[ -n "${PROXY_ANTHROPIC_UPSTREAM_URL:-}" ]]; then
+  ANTHROPIC_UPSTREAM_YAML="  anthropicUpstream:
+    url: $(yaml_quote "$PROXY_ANTHROPIC_UPSTREAM_URL")"
+  if [[ -n "${PROXY_ANTHROPIC_UPSTREAM_API_KEY:-}" ]]; then
+    ANTHROPIC_UPSTREAM_YAML+="
+    apiKey: $(yaml_quote "$PROXY_ANTHROPIC_UPSTREAM_API_KEY")"
+  fi
+fi
+
 info "生成 proxy config → $CONFIG_FILE  (auth=$(bool $PROXY_ENABLE_AUTH) session-init=$(bool $PROXY_ENABLE_SESSION_INIT) tdai=$(bool $PROXY_ENABLE_TDAI) skill-write=$(bool $PROXY_ENABLE_SKILL_WRITE) injectors=${PROXY_INJECTORS:-none})"
 cat > "$CONFIG_FILE" <<YAML
 # 由 start-proxy.sh 自动生成 —— 每次启动覆盖，请不要手动改。
@@ -287,6 +301,7 @@ sessionInit:
 
 costGuard:
   enabled: false
+${ANTHROPIC_UPSTREAM_YAML}
 
 # 注入器白名单由 .env 的 PROXY_INJECTORS 控制（默认三个全开）。
 # knowledge 依赖 memory-hub 起来，否则 hook 内部会降级为空块。
@@ -297,6 +312,11 @@ injection:
   injectors:
 ${INJECTORS_YAML}  assetReflection:
     markerOptIn: $(bool "$PROXY_ASSET_REFLECTION")
+  # <skill_tools> / <tdai_memory_tools> 里嵌的 curl base。
+  # 不设时 proxy 回落到自动探测到的容器 IP（172.18.0.4:8096）：WSL 内可达，
+  # 但 Windows 侧不可达（mirrored 网络模式下 Docker 发布端口不通）。
+  # 127.0.0.1:9096 = wsl-relay(9096) -> docker(8096)，Windows 与 WSL 两侧都能访问。
+  externalGatewayUrl: "${PROXY_EXTERNAL_GATEWAY_URL:-http://127.0.0.1:9096}"
 
 # skill-bridge 的写权限：false 时 patch / create / update / delete / files-write 一律 40302。
 # 打开后主模型可直接创建、修改 skill（见 MemoryProxy/config.example.yaml skillRuntime）。
@@ -308,6 +328,24 @@ skillRuntime:
 ${EXTRACTION_YAML}
 # Context offload 客户端（默认 enabled:false → 热路径零开销）。
 ${OFFLOAD_YAML}
+# ClickHouse 用量埋点 —— Proxy 是 usage_logs / tool_call_logs 的**写入方**。
+# 关闭时 enabled:false：用量不落库，Panel 的 Analytics 页只会显示 "Not enabled"。
+# 打开需要三处同时指向同一个实例（见 INSTALL.md「Analytics」）：
+#   Proxy 写（本段）+ Knowledge 写（KNOWLEDGE_CLICKHOUSE_*）+ Core 读
+#   （ANALYTICS_CLICKHOUSE_*）。本地一键起 CH：./start-clickhouse.sh。
+clickhouse:
+  enabled: $(bool "${CLICKHOUSE_ENABLED:-0}")
+  url: "http://${CLICKHOUSE_HOST:-clickhouse}:8123"
+  database: "${CLICKHOUSE_DATABASE:-context_proxy}"
+  table: usage_logs
+  rawTable: usage_raw
+  user: "${CLICKHOUSE_USER:-tdai}"
+  password: "${CLICKHOUSE_PASSWORD:-}"
+  flushIntervalMs: 5000
+  flushThreshold: 50
+  # 0 = 不自动过期（本地排查方便）；想要 TTL 就填天数。
+  ttlDays: 0
+
 redis:
   enabled: false
 YAML
@@ -316,12 +354,23 @@ YAML
 # 容器 ENTRYPOINT 是 `node --import tsx/esm src/index.ts`（Dockerfile:105），
 # 直接执行 TS 源码、不预编译 —— 所以把改过的源文件只读挂进去就生效，无需重建镜像。
 #
-# 修的是 session-init 的 `getLastUserMessageText`（session/*/cleaner.ts）：
+# 1) 修的是 session-init 的 `getLastUserMessageText`（session/*/cleaner.ts）：
 # dsh 原生 `ask_user_question` 的回答，tool_call_id 是上游 LLM 的普通 id
 # （`call_00_…`），不带 proxy 伪造表的 `call_dsh_session_init_` 前缀。旧逻辑
 # 不认领它 → 扫描回退到上一阶段（team_select）的旧回答 → extractAgentOnly
 # 永远抽不到 agent → attemptCount 到 maxRetries → status:initialized +
 # bypassed:true → 整个会话 L0 一条都不写。
+# Anthropic 侧同因异形：回答装在 role=user 的 tool_result 块里（用
+# tool_use_id 指回 `toolu_…`），cleaner 必须同时认领两种形状。
+#
+# 2) 修的是 dsh session-init form 的双协议形状（session/dsh/form.ts +
+# session/index.ts）：dsh 0.1.6-alpha.1 起 `llm-deepseek.protocol` 默认
+# `messages`，请求 `${baseURL}/v1/messages` 并按 Anthropic 形状解析 SSE，
+# 逐帧要求 `event:` 与 `data.type` 同值。旧 form 只出 OpenAI 形状
+# （`data: {object:"chat.completion.chunk",…}`，无 `type` 字段），官方 web
+# surface 拿到的首帧就被 Messages 解析器判死：
+# "DeepSeek Messages SSE event type mismatch"（MALFORMED_RESPONSE）→ 一个回合
+# 都起不来。form.ts 按协议出两种形状，index.ts 负责把 reqCtx.protocol 透传下去。
 #
 # 源码目录不存在时（例如只拷了 deploy/ 目录单独部署）静默跳过，保持镜像原行为。
 SRC_ROOT="$SCRIPT_DIR/../../MemoryProxy/src"
@@ -329,6 +378,11 @@ SRC_MOUNTS=()
 if [[ -f "$SRC_ROOT/session/codebuddy/cleaner.ts" ]]; then
   SRC_MOUNTS+=(-v "$SRC_ROOT/session/codebuddy/cleaner.ts:/app/src/session/codebuddy/cleaner.ts:ro")
   SRC_MOUNTS+=(-v "$SRC_ROOT/session/claude-code/cleaner.ts:/app/src/session/claude-code/cleaner.ts:ro")
+  SRC_MOUNTS+=(-v "$SRC_ROOT/session/dsh/form.ts:/app/src/session/dsh/form.ts:ro")
+  # server.ts 注册路由表：镜像里的版本没有 dsh 的 /:agent/:spaceId/v1/messages，
+  # dsh 0.1.7 的 llm-deepseek 只说 Messages 线 → 不挂这个文件就 404。
+  SRC_MOUNTS+=(-v "$SRC_ROOT/server.ts:/app/src/server.ts:ro")
+  SRC_MOUNTS+=(-v "$SRC_ROOT/session/index.ts:/app/src/session/index.ts:ro")
   # offload 客户端是新目录（镜像内没有）：整目录挂进去，改完只需重启容器。
   if [[ -d "$SRC_ROOT/offload" ]]; then
     SRC_MOUNTS+=(-v "$SRC_ROOT/offload:/app/src/offload:ro")
@@ -339,7 +393,7 @@ if [[ -f "$SRC_ROOT/session/codebuddy/cleaner.ts" ]]; then
     # config.ts 负责解析生成的 `offload:` 段（镜像内不认识），必须一起挂。
     SRC_MOUNTS+=(-v "$SRC_ROOT/config.ts:/app/src/config.ts:ro")
   fi
-  info "挂载本地源码热修 → cleaner.ts (codebuddy + claude-code) + offload/ + handler.ts + anthropicHandler.ts + config.ts"
+  info "挂载本地源码热修 → server.ts + cleaner.ts (codebuddy + claude-code) + dsh/form.ts + session/index.ts + offload/ + handler.ts + anthropicHandler.ts + config.ts"
 else
   warn "未找到 $SRC_ROOT，跳过源码热修挂载（沿用镜像内源码）"
 fi
