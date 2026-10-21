@@ -6,6 +6,7 @@
  * LLM config can also be passed explicitly to createKnowledgeModule.
  */
 import { homedir } from "node:os";
+import { join } from "node:path";
 import 'dotenv/config';
 
 /** Expand leading ~/ to the user's home directory. */
@@ -59,8 +60,21 @@ export interface ClickHouseTelemetryConfig {
 export interface ServiceConfig {
   /** HTTP server port. */
   port: number;
+  /**
+   * Service-to-service auth.
+   * serviceKey 为空 = 不启用鉴权（向后兼容本地/开发部署）；
+   * 非空 = /v3 下除只读白名单外的端点均要求 `Authorization: Bearer <serviceKey>`。
+   */
+  auth: {
+    serviceKey: string;
+  };
   /** Data root directory for knowledge assets (git clones, wiki dirs, SQLite). */
   dataDir: string;
+  /**
+   * SSH 密钥根目录（每用户一对 RSA，clone 时经 GIT_SSH_COMMAND 注入）。
+   * 默认 `${dataDir}/ssh-keys` —— 落在已挂载的持久化数据卷内。
+   */
+  sshKeyDir: string;
   /** SQLite database file path. */
   dbPath: string;
   /** LLM configuration for wiki ingest. */
@@ -151,9 +165,16 @@ export function loadConfig(): ServiceConfig {
   };
   validateClickHouseConfig(clickhouse);
 
+  const dataDir = expandHome(env("KNOWLEDGE_DATA_DIR", "./data"));
+
   return {
     port: envInt("PORT", 8421),
-    dataDir: expandHome(env("KNOWLEDGE_DATA_DIR", "./data")),
+    auth: {
+      serviceKey: env("KNOWLEDGE_SERVICE_KEY", ""),
+    },
+    dataDir,
+    // 未显式配置 → 落在数据卷内，随 /data/knowledge 一起持久化。
+    sshKeyDir: expandHome(env("KNOWLEDGE_SSH_KEY_DIR", join(dataDir, "ssh-keys"))),
     dbPath: expandHome(env("KNOWLEDGE_DB_PATH", "./data/knowledge.db")),
     logLevel: env("LOG_LEVEL", "debug"),
     apiPrefix: env("API_PREFIX", "/v3"),
